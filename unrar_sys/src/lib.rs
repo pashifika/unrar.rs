@@ -26,6 +26,10 @@ extern crate std;
 
 use libc::wchar_t;
 
+/// Re-exported because it appears in this crate's public API — `HeaderDataEx::file_name_ex`
+/// is a `*mut wchar_t` — and a caller cannot name the buffer type without it.
+pub use libc::wchar_t as WcharT;
+
 #[cfg(feature = "std")]
 use std::os::raw::{c_char, c_int, c_uchar, c_uint};
 

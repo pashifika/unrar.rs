@@ -4,6 +4,7 @@ use std::fmt;
 use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 bitflags::bitflags! {
     #[derive(Debug, Default)]
@@ -92,32 +93,62 @@ pub enum ExtractStatus {
     Cancelled,
 }
 
+/// Serialises every call into libunrar, which is what makes [`Handle`]'s `Send` sound.
+///
+/// libunrar is not thread-safe, and the unsafety is not confined to one archive's state. A
+/// thread-sanitiser harness that opened two archives, moved each to its own thread and drove
+/// them at once reported races in
+/// `Archive::ConvertAttributes`'s function-local `mask` (`arcread.cpp`, which wraps the
+/// process-wide `umask`), in `Unpack29::DDecode`'s lazily built tables, and in the global
+/// `ErrHandler::SetErrorCode` reached from `rdwrfn.cpp` on the abort path. Upstream's
+/// `vendor/patches/0002` removed `ErrHandler.GetErrorCode()` from the DLL's *return* paths,
+/// which is narrower than thread safety and does not cover any of these.
+///
+/// So `Send` cannot rest on "each archive owns its own state": it does not. It rests on this
+/// lock, which is held across each complete transaction rather than each call, because the
+/// callback registered by `RARSetCallback` belongs to the operation that follows it and a
+/// second thread registering its own in between would redirect ours.
+///
+/// # A sink or callback must not re-enter this crate
+///
+/// The lock is not reentrant and user code runs under it — [`DataSink::write_chunk`] and the
+/// [`ExtractEvent`] callback both do. Opening or reading another archive from inside one
+/// deadlocks. Recorded rather than defended against, because the alternative is a reentrant
+/// lock that would let a second archive's calls interleave with the first's, which is the
+/// thing this exists to prevent.
+static DLL: Mutex<()> = Mutex::new(());
+
+/// Takes the lock for one libunrar transaction.
+///
+/// Poisoning is ignored: the mutex guards no Rust data, only the right to be inside the
+/// library, and a panicking caller leaves libunrar no more broken than it left itself.
+fn serialised() -> MutexGuard<'static, ()> {
+    DLL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 struct Handle(NonNull<native::Handle>);
 
 impl Drop for Handle {
     fn drop(&mut self) {
+        let _guard = serialised();
         unsafe { native::RARCloseArchive(self.0.as_ptr() as *const _) };
     }
 }
 
-// SAFETY: the handle owns libunrar's per-archive `DataSet`, and ownership here is exclusive
-// — `Handle` is not `Clone`, not `Copy`, and closes the archive on drop, so exactly one
-// `OpenArchive` ever refers to a given `DataSet` and every DLL call goes through `&mut self`
-// or consumes `self`. Moving that ownership to another thread hands the whole archive over;
-// it does not share it.
+// SAFETY: the handle owns libunrar's per-archive `DataSet`, and ownership here is exclusive —
+// `Handle` is neither `Clone` nor `Copy` and closes the archive on drop, so exactly one
+// `OpenArchive` ever refers to a given `DataSet` and every call goes through `&mut self` or
+// consumes `self`. Moving that ownership to another thread hands the archive over rather than
+// sharing it.
 //
-// Deliberately `Send` and NOT `Sync`: two threads using one archive concurrently would race
-// inside the DLL, and nothing here would stop them.
+// That alone would NOT be enough, and an earlier version of this comment wrongly said it was.
+// libunrar has process-wide mutable state that two archives on two threads both reach; see
+// [`DLL`] for the specific races a thread sanitiser found. Soundness rests on that lock
+// serialising every transaction, not on per-archive ownership.
 //
-// The residual shared state is libunrar's global `ErrHandler` (`global.hpp`). It is not
-// per-archive, so two archives driven from two threads do touch it. Upstream already treats
-// that as a supported scenario and narrowed it: `vendor/patches/0002-fix-readheader-thread-
-// safe-error.patch` removed `ErrHandler.GetErrorCode()` from the return paths of
-// `RARReadHeaderEx` and `ProcessFile` precisely "to avoid global error code interference in
-// multi-threaded environments", leaving each call to report through its own `Cmd.DllError`.
-// What remains on the global is the throw/catch of `ErrHandler.Exit`, which unwinds within a
-// single call, and the `UserBreak` flag.
+// Deliberately `Send` and not `Sync`: sharing one archive between threads would still be
+// wrong, because the type-state cursor is not atomic.
 unsafe impl Send for Handle {}
 
 /// An open RAR archive that can be read or processed.
@@ -317,25 +348,35 @@ impl<Mode: OpenMode> OpenArchive<Mode, CursorBeforeHeader> {
     ) -> UnrarResult<Self> {
         let filename = pathed::construct(filename);
 
-        let mut data =
-            native::OpenArchiveDataEx::new(filename.as_ptr() as *const _, Mode::VALUE as u32);
-        let handle =
-            NonNull::new(unsafe { native::RAROpenArchiveEx(&mut data as *mut _) } as *mut _);
+        // The guard is scoped to the FFI calls and nothing else. `Handle::drop` takes the same
+        // lock, and both the `recover` path below and the failure arm can drop an
+        // `OpenArchive` — under a held guard that would deadlock, so the archive is built
+        // after the guard is gone.
+        let (handle, open_result, flags) = {
+            let _guard = serialised();
 
-        let arc = handle.and_then(|handle| {
-            if let Some(pw) = password {
+            let mut data =
+                native::OpenArchiveDataEx::new(filename.as_ptr() as *const _, Mode::VALUE as u32);
+            let handle =
+                NonNull::new(unsafe { native::RAROpenArchiveEx(&mut data as *mut _) } as *mut _);
+
+            // Part of the same transaction: the password belongs to the archive just opened.
+            if let (Some(handle), Some(pw)) = (handle, password) {
                 let cpw = std::ffi::CString::new(pw).unwrap();
                 unsafe { native::RARSetPassword(handle.as_ptr(), cpw.as_ptr() as *const _) }
             }
-            Some(OpenArchive {
-                handle: Handle(handle),
-                damaged: false,
-                flags: ArchiveFlags::from_bits(data.flags).unwrap(),
-                extra: CursorBeforeHeader,
-                marker: std::marker::PhantomData,
-            })
+
+            (handle, data.open_result, data.flags)
+        };
+
+        let arc = handle.map(|handle| OpenArchive {
+            handle: Handle(handle),
+            damaged: false,
+            flags: ArchiveFlags::from_bits(flags).unwrap(),
+            extra: CursorBeforeHeader,
+            marker: std::marker::PhantomData,
         });
-        let result = Code::from(data.open_result as i32);
+        let result = Code::from(open_result as i32);
 
         match (arc, result) {
             (Some(arc), Code::Success) => Ok(arc),
@@ -641,6 +682,10 @@ impl OpenArchive<Process, CursorBeforeHeader> {
             pending_size: 0,
         };
 
+        // One transaction, and the user's callback runs under the lock — see [`DLL`]: it must
+        // not re-enter this crate.
+        let _guard = serialised();
+
         unsafe {
             native::RARSetCallback(
                 self.handle.0.as_ptr(),
@@ -839,7 +884,19 @@ impl OpenArchive<Process, CursorBeforeFile> {
     }
 }
 
+/// The longest entry name libunrar will produce, plus its terminator.
+///
+/// `MAXPATHSIZE` (`vendor/unrar/rardefs.hpp`) is the ceiling `arcread.cpp` clamps a stored
+/// name to before it is ever decoded, so a buffer of that size cannot be overrun by a name
+/// this library can return. Sized to the ceiling rather than to something merely generous,
+/// because the alternative is a silent cut — see [`read_header`].
+const MAX_NAME_WCHARS: usize = 0x10000 + 1;
+
 fn read_header(handle: &Handle) -> UnrarResult<Option<FileHeader>> {
+    // One transaction: the callback registration and the read that consumes it. A second
+    // thread registering its own between the two would redirect this one's.
+    let _guard = serialised();
+
     let mut userdata: Userdata<<Skip as ProcessMode>::Output> = Default::default();
     unsafe {
         native::RARSetCallback(
@@ -848,12 +905,41 @@ fn read_header(handle: &Handle) -> UnrarResult<Option<FileHeader>> {
             &mut userdata as *mut _ as native::LPARAM,
         );
     }
-    let mut header = native::HeaderDataEx::default();
-    let read_result = Code::from(unsafe {
-        native::RARReadHeaderEx(handle.0.as_ptr(), &mut header as *mut _)
-    });
+
+    // `HeaderDataEx::FileNameW` is a fixed `[wchar_t; 1024]`, and `dll.cpp` fills it with
+    // `wcsncpyz(.., ASIZE(D->FileNameW))` — so a stored name longer than 1023 characters came
+    // back cut, with nothing to say it had been. A caller that keys on the extension then saw
+    // a name with no extension and passed the entry over: a file silently missing from the
+    // archive it is listing.
+    //
+    // `FileNameEx` is the escape hatch the DLL already provides. `dll.cpp` fills it whenever
+    // it is non-null, bounded by `FileNameExSize` rather than by a fixed array, and this
+    // buffer is sized to libunrar's own `MAXPATHSIZE` ceiling so the bound cannot bite.
+    let mut long_name = vec![0 as native::WcharT; MAX_NAME_WCHARS];
+    let mut header = native::HeaderDataEx {
+        file_name_ex: long_name.as_mut_ptr(),
+        file_name_ex_size: MAX_NAME_WCHARS as c_uint,
+        ..Default::default()
+    };
+
+    let read_result =
+        Code::from(unsafe { native::RARReadHeaderEx(handle.0.as_ptr(), &mut header as *mut _) });
     match read_result {
-        Code::Success => Ok(Some(header.into())),
+        Code::Success => {
+            let mut entry = FileHeader::from(header);
+            // Empty only if the DLL declined to fill it, in which case the short field — cut
+            // or not — is still better than no name at all.
+            let full = unsafe {
+                widestring::WideCString::from_ptr_truncate(
+                    long_name.as_ptr() as *const _,
+                    MAX_NAME_WCHARS,
+                )
+            };
+            if !full.is_empty() {
+                entry.filename = PathBuf::from(full.to_os_string());
+            }
+            Ok(Some(entry))
+        }
         Code::EndArchive => Ok(None),
         _ => Err(UnrarError::from(read_result, When::Read)),
     }
@@ -1004,6 +1090,10 @@ impl<M: ProcessMode> Internal<M> {
         file: Option<&pathed::RarStr>,
         output: M::Output,
     ) -> (M::Output, UnrarResult<()>) {
+        // One transaction: registering the callback and running the operation that uses it.
+        // The sink runs under this lock — see [`DLL`]: it must not re-enter this crate.
+        let _guard = serialised();
+
         let mut user_data: Userdata<M::Output> = (output, None, false);
         unsafe {
             native::RARSetCallback(
