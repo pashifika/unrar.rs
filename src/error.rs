@@ -39,6 +39,17 @@ pub enum Code {
     /// `ERAR_*`. Distinct from [`Code::Unknown`], which corresponds to the
     /// upstream `ERAR_UNKNOWN(21)` constant.
     Unmapped(i32),
+    /// The caller's [`DataSink`](crate::DataSink) asked to stop, so the read was
+    /// aborted rather than failing.
+    ///
+    /// Never produced by [`Code::from`]: the DLL has no code for it. libunrar maps
+    /// a callback that returns `-1` on `UCM_PROCESSDATA` to `RARX_USERBREAK`
+    /// (`vendor/unrar/rdwrfn.cpp`), and `RarErrorToDll` has no case for that, so it
+    /// arrives as `ERAR_UNKNOWN` and is indistinguishable from a genuine failure.
+    /// The wrapper remembers that it was the one who stopped and substitutes this,
+    /// the same way [`ExtractStatus::Cancelled`](crate::ExtractStatus::Cancelled)
+    /// recovers a cancel the DLL reports as success.
+    Aborted,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -117,6 +128,7 @@ impl fmt::Display for UnrarError {
             (EReference, _) => write!(f, "Cannot open file source for reference record"),
             (BadPassword, _) => write!(f, "Wrong password was specified"),
             (LargeDict, _) => write!(f, "Archive uses a dictionary too large for this build"),
+            (Aborted, _) => write!(f, "Read aborted by the caller's sink"),
             (Unmapped(c), _) => write!(f, "Unmapped DLL error code: {c}"),
             (Unknown, _) => write!(f, "Unknown error"),
             (EndArchive, _) => write!(f, "Archive end"),

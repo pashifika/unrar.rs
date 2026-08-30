@@ -112,7 +112,11 @@ pub struct OpenArchive<M: OpenMode, C: Cursor> {
     extra: C,
     marker: std::marker::PhantomData<M>,
 }
-type Userdata<T> = (T, Option<widestring::WideCString>);
+/// Per-call state the C callback writes into.
+///
+/// The third slot records that *we* aborted the read, because the DLL cannot tell us:
+/// `RARX_USERBREAK` has no `RarErrorToDll` case and surfaces as `ERAR_UNKNOWN`.
+type Userdata<T> = (T, Option<widestring::WideCString>, bool);
 
 mod private {
     use super::native;
@@ -703,7 +707,10 @@ impl<M: OpenMode> OpenArchive<M, CursorBeforeFile> {
         self,
         path: Option<&pathed::RarStr>,
         file: Option<&pathed::RarStr>,
-    ) -> UnrarResult<OpenArchive<M, CursorBeforeHeader>> {
+    ) -> UnrarResult<OpenArchive<M, CursorBeforeHeader>>
+    where
+        PM::Output: Default,
+    {
         Ok(self.process_file_x::<PM>(path, file)?.1)
     }
 
@@ -711,7 +718,10 @@ impl<M: OpenMode> OpenArchive<M, CursorBeforeFile> {
         self,
         path: Option<&pathed::RarStr>,
         file: Option<&pathed::RarStr>,
-    ) -> UnrarResult<(PM::Output, OpenArchive<M, CursorBeforeHeader>)> {
+    ) -> UnrarResult<(PM::Output, OpenArchive<M, CursorBeforeHeader>)>
+    where
+        PM::Output: Default,
+    {
         let result = Ok((
             Internal::<PM>::process_file_raw(&self.handle, path, file)?,
             OpenArchive {
@@ -730,7 +740,35 @@ impl OpenArchive<Process, CursorBeforeFile> {
     /// Reads the underlying file into a `Vec<u8>`
     /// Returns the data as well as the owned Archive that can be processed further.
     pub fn read(self) -> UnrarResult<(Vec<u8>, OpenArchive<Process, CursorBeforeHeader>)> {
-        Ok(self.process_file_x::<ReadToVec>(None, None)?)
+        let (bytes, result) = self.read_into(Vec::new());
+        result.map(|archive| (bytes, archive))
+    }
+
+    /// Reads the underlying file, handing each chunk to `sink` as the DLL produces it.
+    ///
+    /// Nothing is written to disk: this runs the DLL's test operation and captures the
+    /// bytes through the data callback.
+    ///
+    /// The sink comes back either way, so a sink that stopped early still carries what it
+    /// took. The archive comes back only on success — [`DataSink::write_chunk`] returning
+    /// `false` unwinds the DLL's extraction, which leaves the handle's cursor somewhere
+    /// this wrapper cannot describe, so continuing from it is not offered. An aborted read
+    /// is [`Code::Aborted`](crate::error::Code::Aborted) rather than an error the DLL
+    /// raised.
+    pub fn read_into<S: DataSink + core::fmt::Debug>(
+        self,
+        sink: S,
+    ) -> (S, UnrarResult<OpenArchive<Process, CursorBeforeHeader>>) {
+        let (sink, result) =
+            Internal::<ReadToSink<S>>::process_file_raw_with(&self.handle, None, None, sink);
+        let archive = OpenArchive {
+            extra: CursorBeforeHeader,
+            damaged: self.damaged,
+            handle: self.handle,
+            flags: self.flags,
+            marker: std::marker::PhantomData,
+        };
+        (sink, result.map(|()| archive))
     }
 
     /// Test the file without extracting it
@@ -802,10 +840,35 @@ fn read_header(handle: &Handle) -> UnrarResult<Option<FileHeader>> {
     }
 }
 
+/// Where an entry's bytes go as libunrar produces them.
+///
+/// The DLL pushes an entry through `UCM_PROCESSDATA` in chunks rather than handing over a
+/// reader the caller drives, so this is the only seam at which a caller can see the bytes
+/// — and the only one at which it can decline the rest of them.
+///
+/// Returning `false` aborts the read. That matters for a caller that has to bound what it
+/// holds: without it, the only way to stop an entry that turns out to be larger than the
+/// caller can accept is to let the whole thing arrive first, which is not a bound.
+/// libunrar has supported this the whole time — `vendor/unrar/rdwrfn.cpp` calls
+/// `ErrHandler.Exit(RARX_USERBREAK)` when the callback returns `-1` — and only this
+/// wrapper's hardcoded `0` stood in the way.
+pub trait DataSink {
+    /// Takes one chunk. Returns `false` to abort the read.
+    fn write_chunk(&mut self, chunk: &[u8]) -> bool;
+}
+
+/// Accumulates the whole entry, which is what [`OpenArchive::read`] does.
+impl DataSink for Vec<u8> {
+    fn write_chunk(&mut self, chunk: &[u8]) -> bool {
+        self.extend_from_slice(chunk);
+        true
+    }
+}
+
 #[derive(Debug)]
 struct Skip;
 #[derive(Debug)]
-struct ReadToVec;
+struct ReadToSink<S>(std::marker::PhantomData<S>);
 #[derive(Debug)]
 struct Extract;
 #[derive(Debug)]
@@ -813,35 +876,44 @@ struct Test;
 
 trait ProcessMode: core::fmt::Debug {
     const OPERATION: private::Operation;
-    type Output: core::fmt::Debug + std::default::Default;
+    type Output: core::fmt::Debug;
 
-    fn process_data(data: &mut Self::Output, other: &[u8]);
+    /// Returns `false` to abort the operation.
+    fn process_data(data: &mut Self::Output, other: &[u8]) -> bool;
 }
 impl ProcessMode for Skip {
     const OPERATION: private::Operation = private::Operation::Skip;
     type Output = ();
 
-    fn process_data(_: &mut Self::Output, _: &[u8]) {}
+    fn process_data(_: &mut Self::Output, _: &[u8]) -> bool {
+        true
+    }
 }
-impl ProcessMode for ReadToVec {
+impl<S: DataSink + core::fmt::Debug> ProcessMode for ReadToSink<S> {
+    // `Test`, not `Extract`: the bytes are captured through the callback and nothing is
+    // written to disk.
     const OPERATION: private::Operation = private::Operation::Test;
-    type Output = Vec<u8>;
+    type Output = S;
 
-    fn process_data(my: &mut Self::Output, other: &[u8]) {
-        my.extend_from_slice(other);
+    fn process_data(sink: &mut Self::Output, other: &[u8]) -> bool {
+        sink.write_chunk(other)
     }
 }
 impl ProcessMode for Extract {
     const OPERATION: private::Operation = private::Operation::Extract;
     type Output = ();
 
-    fn process_data(_: &mut Self::Output, _: &[u8]) {}
+    fn process_data(_: &mut Self::Output, _: &[u8]) -> bool {
+        true
+    }
 }
 impl ProcessMode for Test {
     const OPERATION: private::Operation = private::Operation::Test;
     type Output = ();
 
-    fn process_data(_: &mut Self::Output, _: &[u8]) {}
+    fn process_data(_: &mut Self::Output, _: &[u8]) -> bool {
+        true
+    }
 }
 
 struct Internal<M: ProcessMode> {
@@ -875,8 +947,14 @@ impl<M: ProcessMode> Internal<M> {
             }
             native::UCM_PROCESSDATA => {
                 let raw_slice = std::ptr::slice_from_raw_parts(p1 as *const u8, p2 as _);
-                M::process_data(&mut user_data.0, unsafe { &*raw_slice as &_ });
-                0
+                if M::process_data(&mut user_data.0, unsafe { &*raw_slice as &_ }) {
+                    0
+                } else {
+                    // Recorded because the DLL will not tell us: `RARX_USERBREAK` has no
+                    // `RarErrorToDll` case and comes back as `ERAR_UNKNOWN`.
+                    user_data.2 = true;
+                    -1
+                }
             }
             _ => 0,
         }
@@ -886,8 +964,28 @@ impl<M: ProcessMode> Internal<M> {
         handle: &Handle,
         path: Option<&pathed::RarStr>,
         file: Option<&pathed::RarStr>,
-    ) -> UnrarResult<M::Output> {
-        let mut user_data: Userdata<M::Output> = Default::default();
+    ) -> UnrarResult<M::Output>
+    where
+        M::Output: Default,
+    {
+        let (output, result) =
+            Self::process_file_raw_with(handle, path, file, M::Output::default());
+        result.map(|()| output)
+    }
+
+    /// As [`Self::process_file_raw`], but the caller supplies the output and gets it back
+    /// whichever way the call went.
+    ///
+    /// Returning it on the error path is the point: a sink that aborted holds what it read
+    /// before it stopped, and a sink the caller configured is not reconstructible from
+    /// `Default`.
+    fn process_file_raw_with(
+        handle: &Handle,
+        path: Option<&pathed::RarStr>,
+        file: Option<&pathed::RarStr>,
+        output: M::Output,
+    ) -> (M::Output, UnrarResult<()>) {
+        let mut user_data: Userdata<M::Output> = (output, None, false);
         unsafe {
             native::RARSetCallback(
                 handle.0.as_ptr(),
@@ -901,10 +999,14 @@ impl<M: ProcessMode> Internal<M> {
             path,
             file,
         ));
-        match process_result {
-            Code::Success => Ok(user_data.0),
+        let result = match process_result {
+            Code::Success => Ok(()),
+            // Our own abort, recovered before the DLL's `ERAR_UNKNOWN` can be mistaken for
+            // a real failure.
+            _ if user_data.2 => Err(UnrarError::from(Code::Aborted, When::Process)),
             _ => Err(UnrarError::from(process_result, When::Process)),
-        }
+        };
+        (user_data.0, result)
     }
 }
 
