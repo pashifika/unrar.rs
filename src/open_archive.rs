@@ -101,6 +101,25 @@ impl Drop for Handle {
     }
 }
 
+// SAFETY: the handle owns libunrar's per-archive `DataSet`, and ownership here is exclusive
+// — `Handle` is not `Clone`, not `Copy`, and closes the archive on drop, so exactly one
+// `OpenArchive` ever refers to a given `DataSet` and every DLL call goes through `&mut self`
+// or consumes `self`. Moving that ownership to another thread hands the whole archive over;
+// it does not share it.
+//
+// Deliberately `Send` and NOT `Sync`: two threads using one archive concurrently would race
+// inside the DLL, and nothing here would stop them.
+//
+// The residual shared state is libunrar's global `ErrHandler` (`global.hpp`). It is not
+// per-archive, so two archives driven from two threads do touch it. Upstream already treats
+// that as a supported scenario and narrowed it: `vendor/patches/0002-fix-readheader-thread-
+// safe-error.patch` removed `ErrHandler.GetErrorCode()` from the return paths of
+// `RARReadHeaderEx` and `ProcessFile` precisely "to avoid global error code interference in
+// multi-threaded environments", leaving each call to report through its own `Cmd.DllError`.
+// What remains on the global is the throw/catch of `ErrHandler.Exit`, which unwinds within a
+// single call, and the `UserBreak` flag.
+unsafe impl Send for Handle {}
+
 /// An open RAR archive that can be read or processed.
 ///
 /// See the [OpenArchive chapter](index.html#openarchive) for more information.
